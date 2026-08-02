@@ -370,15 +370,39 @@ class Gemma4Attention(JaxModule):
             prefix=prefix + ".q_norm",
         )
 
-        self.k_norm = JaxRmsNorm(
-            self.head_dim,
-            epsilon=self.rms_norm_eps,
-            param_dtype=dtype,
-            scale_init=nnx.with_partitioning(init_fn, (None, )),
-            rngs=rng,
-            quant_config=quant_config,
-            prefix=prefix + ".k_norm",
-        )
+        # KV-cache sharing (mirrors vllm-pytorch `Gemma4Attention.__init__`
+        # KV-share derivation). Layers in the last `num_kv_shared_layers`
+        # reuse K/V from earlier layers of matching attention type. The
+        # runner side populates the redirect mapping; this layer just needs
+        # to set is_kv_shared_layer + kv_sharing_target_layer_name.
+        kv_share_map = compute_kv_share_map(config)
+        self.is_kv_shared_layer = layer_idx in kv_share_map
+        self.kv_sharing_target_layer_name: Optional[str] = None
+        if self.is_kv_shared_layer:
+            # The runner uses unprefixed "layer.{i}" keys; this string must
+            # match the keys produced by KVCacheManager's spec-creation loop
+            # and Gemma4Model's layer-name iteration.
+            self.kv_sharing_target_layer_name = (
+                f"layer.{kv_share_map[layer_idx]}")
+
+        # KV-shared layers read K from the source layer's cache, where it was
+        # already k_norm-ed (and RoPE-ed) before being written, so they have
+        # no k_norm of their own. Creating one would register a param the
+        # loader then demands from the checkpoint — architecturally-minimal
+        # exports (e.g. Gemma-4 E2B QAT) correctly omit these tensors.
+        # Mirrors HF transformers' conditional creation (#3225).
+        if self.is_kv_shared_layer:
+            self.k_norm = None
+        else:
+            self.k_norm = JaxRmsNorm(
+                self.head_dim,
+                epsilon=self.rms_norm_eps,
+                param_dtype=dtype,
+                scale_init=nnx.with_partitioning(init_fn, (None, )),
+                rngs=rng,
+                quant_config=quant_config,
+                prefix=prefix + ".k_norm",
+            )
         # V norm: no learnable scale (pure normalization only)
         self.v_norm = JaxRmsNorm(
             self.head_dim,
@@ -410,21 +434,6 @@ class Gemma4Attention(JaxModule):
         if kv_cache_dtype != "auto":
             self.kv_cache_quantized_dtype = utils.get_jax_dtype_from_str_dtype(
                 kv_cache_dtype)
-
-        # KV-cache sharing (mirrors vllm-pytorch `Gemma4Attention.__init__`
-        # KV-share derivation). Layers in the last `num_kv_shared_layers`
-        # reuse K/V from earlier layers of matching attention type. The
-        # runner side populates the redirect mapping; this layer just needs
-        # to set is_kv_shared_layer + kv_sharing_target_layer_name.
-        kv_share_map = compute_kv_share_map(config)
-        self.is_kv_shared_layer = layer_idx in kv_share_map
-        self.kv_sharing_target_layer_name: Optional[str] = None
-        if self.is_kv_shared_layer:
-            # The runner uses unprefixed "layer.{i}" keys; this string must
-            # match the keys produced by KVCacheManager's spec-creation loop
-            # and Gemma4Model's layer-name iteration.
-            self.kv_sharing_target_layer_name = (
-                f"layer.{kv_share_map[layer_idx]}")
 
     def __call__(
         self,
@@ -1064,11 +1073,21 @@ class Gemma4ForCausalLM(JaxModule, LoadableWithIterator):
         # attr path "language_model.*".  mapper.apply() runs before the loader's
         # packed routing so params_dict lookups succeed.
         mapper = WeightsMapper(orig_to_new_prefix={"model.": ""})
+        # KV-shared layers have no k_norm param (see Gemma4Attention), but
+        # non-QAT exports still ship unused k_norm tensors for those layers;
+        # tolerate them the same way the loader tolerates GPTQ's unexpected
+        # ".bias" tensors (#3225).
+        kv_share_map = compute_kv_share_map(
+            self.vllm_config.model_config.hf_config.text_config)
         loader = JaxAutoWeightsLoader(
             self,
             skip_prefixes=(["lm_head"]
                            if not hasattr(self, 'lm_head') else []),
             skip_substrs=["vision", "audio", "multi_modal"],
+            ignore_unexpected_prefixes=[
+                f"language_model.layers.{i}.self_attn.k_norm"
+                for i in kv_share_map
+            ],
         )
         return loader.load_weights(mapper.apply(weights))
 

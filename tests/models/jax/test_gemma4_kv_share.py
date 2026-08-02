@@ -35,8 +35,10 @@ from flax import nnx
 from jax.sharding import Mesh
 from transformers import Gemma4TextConfig
 
+import torch
+
 from tpu_inference.models.common.kv_share import compute_kv_share_map
-from tpu_inference.models.jax.gemma4 import Gemma4Model
+from tpu_inference.models.jax.gemma4 import Gemma4ForCausalLM, Gemma4Model
 
 
 @pytest.fixture(scope="module")
@@ -265,6 +267,67 @@ def test_kv_share_with_ple_active(mesh, rng=jax.random.PRNGKey(0)):
     # Model-level PLE present.
     assert model.embed_tokens_per_layer is not None
     assert model.per_layer_model_projection is not None
+
+
+def test_shared_layers_have_no_k_norm(mesh, rng=jax.random.PRNGKey(0)):
+    """#3225: KV-shared layers must not create k_norm. A created module
+    registers a param the loader then demands from the checkpoint, but
+    architecturally-minimal exports (Gemma-4 E2B QAT) correctly omit
+    k_norm for shared layers — so creation must be conditional."""
+    text_config = _make_text_config(num_hidden_layers=4,
+                                    num_kv_shared_layers=2,
+                                    layer_types=["full_attention"] * 4)
+    vllm_config = _make_vllm_config(text_config)
+    with jax.set_mesh(mesh):
+        model = Gemma4Model(vllm_config, nnx.Rngs(rng), mesh)
+
+    assert model.layers[0].self_attn.k_norm is not None
+    assert model.layers[1].self_attn.k_norm is not None
+    assert model.layers[2].self_attn.k_norm is None
+    assert model.layers[3].self_attn.k_norm is None
+
+    # The property that actually fixes the QAT load failure: shared-layer
+    # k_norm must be absent from the declared param set the load-tracking
+    # check runs against.
+    param_names = [name for name, _ in model.named_parameters()]
+    assert any("layers.0.self_attn.k_norm" in n for n in param_names)
+    assert not any("layers.2.self_attn.k_norm" in n for n in param_names)
+    assert not any("layers.3.self_attn.k_norm" in n for n in param_names)
+
+
+def _make_causal_lm(mesh, num_layers=4, num_shared=2):
+    text_config = _make_text_config(num_hidden_layers=num_layers,
+                                    num_kv_shared_layers=num_shared,
+                                    layer_types=["full_attention"] *
+                                    num_layers)
+    vllm_config = _make_vllm_config(text_config)
+    # Guard against MagicMock auto-attrs (truthy Mocks) tripping optional
+    # feature branches during construction.
+    vllm_config.lora_config = None
+    with jax.set_mesh(mesh):
+        return Gemma4ForCausalLM(vllm_config, jax.random.PRNGKey(0), mesh)
+
+
+def test_load_tolerates_junk_shared_k_norm(mesh):
+    """#3225: plain (non-QAT) exports ship unused k_norm tensors for the
+    KV-shared layers. load_weights must ignore exactly those instead of
+    raising the loader's unexpected-key error."""
+    model = _make_causal_lm(mesh)
+    junk = [("model.language_model.layers.2.self_attn.k_norm.weight",
+             torch.zeros(8))]
+    # Must not raise.
+    model.load_weights(iter(junk))
+
+
+def test_load_still_rejects_truly_unknown_keys(mesh):
+    """The #3225 tolerance is scoped to shared-layer k_norm only — any
+    other unknown checkpoint key still fails loudly (silent-swallow of
+    unexpected weights is how garbage-output bugs are born)."""
+    model = _make_causal_lm(mesh)
+    bogus = [("model.language_model.layers.0.self_attn.zz_norm.weight",
+              torch.zeros(8))]
+    with pytest.raises(ValueError, match="no module or parameter"):
+        model.load_weights(iter(bogus))
 
 
 def test_double_wide_mlp(mesh, rng=jax.random.PRNGKey(0)):
